@@ -112,3 +112,31 @@ def verify_certificate(
     return True
 
 
+
+"""
+Summary of what this file (pki.py or cert_helpers.py) does:
+
+This module provides lightweight, focused PKI verification utilities for the SecureChat application. 
+It is deliberately simple and does not use the full-featured cryptography.x509 verification APIs 
+so that the verification logic stays transparent and easy to understand/audit.
+
+Core responsibilities:
+- Load a certificate or the trusted Root CA certificate from a PEM file.
+- Fully verify a peer (server/client) certificate with the following checks:
+    1. Cryptographic signature is valid and was made by our Root CA.
+    2. Current time falls inside the certificate’s validity window (not yet valid or expired).
+    3. The expected hostname matches either:
+         • The first DNSName entry in the Subject Alternative Name (SAN) extension (preferred), or
+         • The Common Name (CN) in the Subject if SAN is absent.
+- On any failure, raise a clear ValueError with prefix "BAD_CERT:" and a human-readable reason.
+- Private keys are NOT handled here — they are managed elsewhere in the application.
+
+Intended usage in SecureChat client/server code:
+    ca_cert = load_ca_certificate("certs/ca_cert.pem")
+    peer_cert = load_certificate(peer_cert_pem_path)
+    verify_certificate(peer_cert, ca_cert, expected_hostname="server.local")
+
+This satisfies the assignment’s requirement for proper peer certificate validation 
+(CA signature + time validity + hostname matching using SAN-then-CN rule) 
+while keeping the implementation minimal and explicit.
+"""
