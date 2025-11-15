@@ -5,8 +5,9 @@ Features:
   - Plain TCP (no TLS).
   - PKI hello/server_hello with X.509 certs + nonces.
   - Certificate verification against local Root CA.
-  - DH key exchange => AES-128(ECB)+PKCS#7 session key.
+  - DH #1 => AES-128(ECB)+PKCS#7 K_auth for registration/login.
   - AES-protected registration/login against server-side MySQL.
+  - DH #2 => AES-128(ECB)+PKCS#7 K_chat for chat session.
   - RSA PKCS#1 v1.5 + SHA-256 signatures on every ChatMsg.
   - Replay protection using seqno.
   - Append-only transcript + TranscriptHash.
@@ -17,12 +18,16 @@ Message flow:
   2) Client -> Server: HelloMsg (client cert + nonceC).
   3) Server -> Client: ServerHelloMsg (server cert + nonceS).
      - Verify server cert using Root CA.
-  4) Client -> Server: DHClientMsg
-  5) Server -> Client: DHServerMsg
-  6) Client -> Server: RegisterMsg/LoginMsg (AES-encrypted credentials)
+  4) Client -> Server: DHClientMsg       (DH #1)
+  5) Server -> Client: DHServerMsg       (DH #1)
+     - Derive K_auth = Trunc16(SHA256(big-endian(Ks_auth))).
+  6) Client -> Server: RegisterMsg/LoginMsg (AES-encrypted with K_auth)
      - Server decrypts and performs registration/login.
-  7) Encrypted chat (ChatMsg) with signatures and replay protection.
-  8) Both sides send/verify SessionReceipt.
+  7) Client -> Server: DHClientMsg       (DH #2)
+  8) Server -> Client: DHServerMsg       (DH #2)
+     - Derive K_chat = Trunc16(SHA256(big-endian(Ks_chat))).
+  9) Encrypted chat (ChatMsg) with K_chat + signatures and replay protection.
+ 10) Both sides send/verify SessionReceipt.
 """
 
 from __future__ import annotations
@@ -138,44 +143,42 @@ def main():
             transcript.close()
             return
 
-        # (We could also check our nonce was echoed or use nonce_s for extra checks.)
+        # ---------- 1) DH #1 handshake (client role, K_auth) ----------
 
-        # ---------- 1) DH handshake (client role) ----------
+        a1_priv = dh.generate_private()
+        A1 = dh.compute_public(dh.DH_G, a1_priv, dh.DH_P)
 
-        a_priv = dh.generate_private()
-        A = dh.compute_public(dh.DH_G, a_priv, dh.DH_P)
-
-        dh_client = DHClientMsg(
+        dh1_client = DHClientMsg(
             g=dh.DH_G,
             p=dh.DH_P,
-            A=A,
+            A=A1,
         )
-        s.sendall(encode_message(dh_client).encode("utf-8") + b"\n")
-        transcript.append_message(dh_client)
-        print(f"[DH] Sent dh client: p={dh.DH_P}, g={dh.DH_G}, A={A}")
+        s.sendall(encode_message(dh1_client).encode("utf-8") + b"\n")
+        transcript.append_message(dh1_client)
+        print(f"[DH1] Sent dh client: p={dh.DH_P}, g={dh.DH_G}, A={A1}")
 
         try:
-            dh_line = next(_recv_lines(s))
+            dh1_line = next(_recv_lines(s))
         except StopIteration:
-            print("[-] Server closed connection during DH handshake")
+            print("[-] Server closed connection during DH #1 handshake")
             transcript.close()
             return
 
-        dh_server = decode_message(dh_line)
-        if not isinstance(dh_server, DHServerMsg):
-            print("[-] Expected 'dh server' message")
+        dh1_server = decode_message(dh1_line)
+        if not isinstance(dh1_server, DHServerMsg):
+            print("[-] Expected 'dh server' message for DH #1")
             transcript.close()
             return
 
-        transcript.append_message(dh_server)
-        B = dh_server.B
-        print(f"[DH] Received dh server: B={B}")
+        transcript.append_message(dh1_server)
+        B1 = dh1_server.B
+        print(f"[DH1] Received dh server: B={B1}")
 
-        shared_secret = dh.compute_shared(B, a_priv, dh.DH_P)
-        K = dh.derive_aes_key(shared_secret)
-        print(f"[DH] Derived shared secret and AES key (len={len(K)})")
+        shared_secret_auth = dh.compute_shared(B1, a1_priv, dh.DH_P)
+        K_auth = dh.derive_aes_key(shared_secret_auth)
+        print(f"[DH1] Derived K_auth (len={len(K_auth)})")
 
-        # ---------- 2) Registration / Login (control plane over AES) ----------
+        # ---------- 2) Registration / Login (control plane over AES with K_auth) ----------
 
         while True:
             mode = input("Auth mode [register/login]: ").strip().lower()
@@ -194,7 +197,7 @@ def main():
                 "password": password,
             }
             inner = json.dumps(payload).encode("utf-8")
-            ct = aes.encrypt_aes_ecb(K, inner)
+            ct = aes.encrypt_aes_ecb(K_auth, inner)
             ct_b64 = b64_encode(ct)
 
             auth_msg = RegisterMsg(ct=ct_b64)
@@ -207,16 +210,51 @@ def main():
                 "password": password,
             }
             inner = json.dumps(payload).encode("utf-8")
-            ct = aes.encrypt_aes_ecb(K, inner)
+            ct = aes.encrypt_aes_ecb(K_auth, inner)
             ct_b64 = b64_encode(ct)
 
             auth_msg = LoginMsg(ct=ct_b64)
 
         s.sendall(encode_message(auth_msg).encode("utf-8") + b"\n")
         transcript.append_message(auth_msg)
-        print(f"[AUTH] Sent {mode} request (encrypted)")
+        print(f"[AUTH] Sent {mode} request (encrypted with K_auth)")
 
-        # ---------- 3) Encrypted chat ----------
+        # ---------- 3) DH #2 handshake (client role, K_chat) ----------
+
+        a2_priv = dh.generate_private()
+        A2 = dh.compute_public(dh.DH_G, a2_priv, dh.DH_P)
+
+        dh2_client = DHClientMsg(
+            g=dh.DH_G,
+            p=dh.DH_P,
+            A=A2,
+        )
+        s.sendall(encode_message(dh2_client).encode("utf-8") + b"\n")
+        transcript.append_message(dh2_client)
+        print(f"[DH2] Sent dh client: p={dh.DH_P}, g={dh.DH_G}, A={A2}")
+
+        try:
+            dh2_line = next(_recv_lines(s))
+        except StopIteration:
+            print("[-] Server closed connection during DH #2 handshake")
+            transcript.close()
+            return
+
+        dh2_server = decode_message(dh2_line)
+        if not isinstance(dh2_server, DHServerMsg):
+            print("[-] Expected 'dh server' message for DH #2")
+            transcript.close()
+            return
+
+        transcript.append_message(dh2_server)
+        B2 = dh2_server.B
+        print(f"[DH2] Received dh server: B={B2}")
+
+        shared_secret_chat = dh.compute_shared(B2, a2_priv, dh.DH_P)
+        K_chat = dh.derive_aes_key(shared_secret_chat)
+        print(f"[DH2] Derived K_chat (len={len(K_chat)})")
+
+        # ---------- 4) Encrypted chat (using K_chat) ----------
 
         stop_event = threading.Event()
 
@@ -274,10 +312,10 @@ def main():
                     # Log after signature passes
                     transcript.append_chat_message(msg)
 
-                    # Decrypt and display
+                    # Decrypt and display with K_chat
                     ct_bytes = b64_decode(ct_b64)
                     try:
-                        pt_bytes = aes.decrypt_aes_ecb(K, ct_bytes)
+                        pt_bytes = aes.decrypt_aes_ecb(K_chat, ct_bytes)
                         plaintext = pt_bytes.decode("utf-8", errors="replace")
                     except Exception as e:
                         print(f"[ERR] Decryption failed: {e}")
@@ -306,7 +344,7 @@ def main():
                     print("[*] Client exiting chat")
                     break
 
-                ct = aes.encrypt_aes_ecb(K, text.encode("utf-8"))
+                ct = aes.encrypt_aes_ecb(K_chat, text.encode("utf-8"))
                 ct_b64 = b64_encode(ct)
 
                 ts = now_ms()
@@ -325,7 +363,7 @@ def main():
                 transcript.append_chat_message(outgoing)
                 s.sendall(encode_message(outgoing).encode("utf-8") + b"\n")
         finally:
-            # ---------- 4) Send SessionReceipt to server ----------
+            # ---------- 5) Send SessionReceipt to server ----------
             print("[*] Preparing SessionReceipt (client)")
 
             t_hash = transcript.transcript_hash_hex()

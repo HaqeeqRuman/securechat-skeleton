@@ -5,8 +5,9 @@ Features:
   - Plain TCP (no TLS).
   - PKI hello/server_hello with X.509 certs + nonces.
   - Certificate verification against local Root CA.
-  - DH key exchange => AES-128(ECB)+PKCS#7 session key.
-  - AES-protected registration/login with MySQL-backed salted hashes.
+  - DH #1 => AES-128(ECB)+PKCS#7 K_auth for registration/login.
+  - MySQL-backed registration/login with salted SHA-256 password hashes.
+  - DH #2 => AES-128(ECB)+PKCS#7 K_chat for chat session.
   - RSA PKCS#1 v1.5 + SHA-256 signatures on every ChatMsg.
   - Replay protection using seqno.
   - Append-only transcript + TranscriptHash.
@@ -17,12 +18,16 @@ Message flow (high level):
   2) Client -> Server: HelloMsg (client cert + nonceC).
   3) Server -> Client: ServerHelloMsg (server cert + nonceS).
      - Both sides verify each other's cert using Root CA.
-  4) Client -> Server: DHClientMsg
-  5) Server -> Client: DHServerMsg
-  6) Client -> Server: RegisterMsg/LoginMsg (AES-encrypted credentials)
+  4) Client -> Server: DHClientMsg   (DH #1)
+  5) Server -> Client: DHServerMsg   (DH #1)
+     - Derive K_auth = Trunc16(SHA256(big-endian(Ks_auth))).
+  6) Client -> Server: RegisterMsg/LoginMsg (AES-encrypted with K_auth)
      - Server decrypts and performs DB-backed auth/registration.
-  7) Encrypted chat (ChatMsg) with signatures and replay protection.
-  8) Both sides send/verify SessionReceipt.
+  7) Client -> Server: DHClientMsg   (DH #2)
+  8) Server -> Client: DHServerMsg   (DH #2)
+     - Derive K_chat = Trunc16(SHA256(big-endian(Ks_chat))).
+  9) Encrypted chat (ChatMsg) with K_chat + signatures and replay protection.
+ 10) Both sides send/verify SessionReceipt (signed transcript hash).
 """
 
 from __future__ import annotations
@@ -145,46 +150,44 @@ def handle_client(conn: socket.socket, addr):
     transcript.append_message(server_hello)
     print("[PKI] Sent server hello with server certificate")
 
-    # (You could verify hello_msg.nonce here if you do a round-trip; for now, we just log it.)
-
-    # ---------- 1) DH handshake (server role) ----------
+    # ---------- 1) DH #1 handshake (server role, K_auth) ----------
 
     try:
-        dh_line = next(_recv_lines(conn))
+        dh1_line = next(_recv_lines(conn))
     except StopIteration:
-        print("[-] Client disconnected during DH handshake")
+        print("[-] Client disconnected during DH #1 handshake")
         conn.close()
         transcript.close()
         return
 
-    dh_client = decode_message(dh_line)
-    if not isinstance(dh_client, DHClientMsg):
-        print("[-] Expected 'dh client' message")
+    dh1_client = decode_message(dh1_line)
+    if not isinstance(dh1_client, DHClientMsg):
+        print("[-] Expected 'dh client' message for DH #1")
         conn.close()
         transcript.close()
         return
 
-    p = dh_client.p
-    g = dh_client.g
-    A = dh_client.A
-    print(f"[DH] Received dh client: p={p}, g={g}, A={A}")
-    transcript.append_message(dh_client)
+    p1 = dh1_client.p
+    g1 = dh1_client.g
+    A1 = dh1_client.A
+    print(f"[DH1] Received dh client: p={p1}, g={g1}, A={A1}")
+    transcript.append_message(dh1_client)
 
-    # Our DH private/public
-    b_priv = dh.generate_private(p)
-    B = dh.compute_public(g, b_priv, p)
+    # Our DH #1 private/public
+    b1_priv = dh.generate_private(p1)
+    B1 = dh.compute_public(g1, b1_priv, p1)
 
-    dh_server = DHServerMsg(B=B)
-    conn.sendall(encode_message(dh_server).encode("utf-8") + b"\n")
-    transcript.append_message(dh_server)
-    print(f"[DH] Sent dh server: B={B}")
+    dh1_server = DHServerMsg(B=B1)
+    conn.sendall(encode_message(dh1_server).encode("utf-8") + b"\n")
+    transcript.append_message(dh1_server)
+    print(f"[DH1] Sent dh server: B={B1}")
 
-    # Compute shared secret + AES key
-    shared_secret = dh.compute_shared(A, b_priv, p)
-    K = dh.derive_aes_key(shared_secret)
-    print(f"[DH] Derived shared secret and AES key (len={len(K)})")
+    # Compute shared secret + AES key for AUTH
+    shared_secret_auth = dh.compute_shared(A1, b1_priv, p1)
+    K_auth = dh.derive_aes_key(shared_secret_auth)
+    print(f"[DH1] Derived K_auth (len={len(K_auth)})")
 
-    # ---------- 2) Registration / Login (control plane over AES) ----------
+    # ---------- 2) Registration / Login (control plane over AES with K_auth) ----------
 
     try:
         auth_line = next(_recv_lines(conn))
@@ -200,7 +203,7 @@ def handle_client(conn: socket.socket, addr):
     if isinstance(auth_msg, RegisterMsg):
         try:
             auth_ct = b64_decode(auth_msg.ct)
-            auth_json = aes.decrypt_aes_ecb(K, auth_ct).decode("utf-8")
+            auth_json = aes.decrypt_aes_ecb(K_auth, auth_ct).decode("utf-8")
             creds = json.loads(auth_json)
             email = creds["email"]
             username = creds["username"]
@@ -227,7 +230,7 @@ def handle_client(conn: socket.socket, addr):
     elif isinstance(auth_msg, LoginMsg):
         try:
             auth_ct = b64_decode(auth_msg.ct)
-            auth_json = aes.decrypt_aes_ecb(K, auth_ct).decode("utf-8")
+            auth_json = aes.decrypt_aes_ecb(K_auth, auth_ct).decode("utf-8")
             creds = json.loads(auth_json)
             email = creds["email"]
             password = creds["password"]
@@ -253,7 +256,43 @@ def handle_client(conn: socket.socket, addr):
         transcript.close()
         return
 
-    # ---------- 3) Encrypted chat loop ----------
+    # ---------- 3) DH #2 handshake (server role, K_chat) ----------
+
+    try:
+        dh2_line = next(_recv_lines(conn))
+    except StopIteration:
+        print("[-] Client disconnected during DH #2 handshake")
+        conn.close()
+        transcript.close()
+        return
+
+    dh2_client = decode_message(dh2_line)
+    if not isinstance(dh2_client, DHClientMsg):
+        print("[-] Expected 'dh client' message for DH #2")
+        conn.close()
+        transcript.close()
+        return
+
+    p2 = dh2_client.p
+    g2 = dh2_client.g
+    A2 = dh2_client.A
+    print(f"[DH2] Received dh client: p={p2}, g={g2}, A={A2}")
+    transcript.append_message(dh2_client)
+
+    # Our DH #2 private/public
+    b2_priv = dh.generate_private(p2)
+    B2 = dh.compute_public(g2, b2_priv, p2)
+
+    dh2_server = DHServerMsg(B=B2)
+    conn.sendall(encode_message(dh2_server).encode("utf-8") + b"\n")
+    transcript.append_message(dh2_server)
+    print(f"[DH2] Sent dh server: B={B2}")
+
+    shared_secret_chat = dh.compute_shared(A2, b2_priv, p2)
+    K_chat = dh.derive_aes_key(shared_secret_chat)
+    print(f"[DH2] Derived K_chat (len={len(K_chat)})")
+
+    # ---------- 4) Encrypted chat loop (using K_chat) ----------
 
     stop_event = threading.Event()
 
@@ -312,10 +351,10 @@ def handle_client(conn: socket.socket, addr):
                 # Log after signature passes
                 transcript.append_chat_message(incoming)
 
-                # Decrypt and display
+                # Decrypt and display with K_chat
                 ct_bytes = b64_decode(ct_b64)
                 try:
-                    pt_bytes = aes.decrypt_aes_ecb(K, ct_bytes)
+                    pt_bytes = aes.decrypt_aes_ecb(K_chat, ct_bytes)
                     plaintext = pt_bytes.decode("utf-8", errors="replace")
                 except Exception as e:
                     print(f"[ERR] Decryption failed: {e}")
@@ -345,7 +384,7 @@ def handle_client(conn: socket.socket, addr):
                 print("[*] Server exiting chat with client")
                 break
 
-            ct = aes.encrypt_aes_ecb(K, text.encode("utf-8"))
+            ct = aes.encrypt_aes_ecb(K_chat, text.encode("utf-8"))
             ct_b64 = b64_encode(ct)
 
             ts = now_ms()
@@ -364,7 +403,7 @@ def handle_client(conn: socket.socket, addr):
             transcript.append_chat_message(outgoing)
             conn.sendall(encode_message(outgoing).encode("utf-8") + b"\n")
     finally:
-        # ---------- 4) Send SessionReceipt to client ----------
+        # ---------- 5) Send SessionReceipt to client ----------
         print("[*] Preparing SessionReceipt (server)")
 
         t_hash = transcript.transcript_hash_hex()
