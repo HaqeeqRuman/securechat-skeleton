@@ -32,6 +32,8 @@ Message flow (high level):
 
 from __future__ import annotations
 
+from cryptography.hazmat.primitives import hashes
+
 import os
 import socket
 import threading
@@ -131,6 +133,10 @@ def handle_client(conn: socket.socket, addr):
         pki.verify_certificate(client_cert, ca_cert, expected_hostname="client.local")
         peer_pub_key = client_cert.public_key()
         print("[PKI] Client certificate verified (CN=client.local)")
+
+        # NEW: record peer cert fingerprint in transcript for non-repudiation
+        fp = client_cert.fingerprint(hashes.SHA256()).hex()
+        transcript.set_peer_cert_fingerprint(fp)
     except Exception as e:
         print(f"[BAD_CERT] Client certificate verification failed: {e}")
         conn.close()
@@ -348,7 +354,7 @@ def handle_client(conn: socket.socket, addr):
                     peer_first_seq = incoming.seqno
                 peer_last_seq = incoming.seqno
 
-                # Log after signature passes
+                # Log after signature passes (includes fingerprint if set)
                 transcript.append_chat_message(incoming)
 
                 # Decrypt and display with K_chat
@@ -400,6 +406,7 @@ def handle_client(conn: socket.socket, addr):
             )
             seqno += 1
 
+            # Log with peer_cert_fp included
             transcript.append_chat_message(outgoing)
             conn.sendall(encode_message(outgoing).encode("utf-8") + b"\n")
     finally:

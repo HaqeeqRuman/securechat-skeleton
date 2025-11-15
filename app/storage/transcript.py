@@ -15,6 +15,9 @@ Typical usage pattern (per session):
     # For every message sent/received:
     t.append_message(msg)
 
+    # For chat messages, you can also call:
+    t.append_chat_message(chat_msg)
+
     # At teardown:
     h_hex = t.transcript_hash_hex()
     t.close()
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -43,6 +47,9 @@ class Transcript:
     - Maintains a running SHA-256 over the *exact* bytes written.
     - Designed so that both client and server can produce identical
       TranscriptHash values when they log messages in the same order.
+
+    Optionally, a peer certificate fingerprint (hex) can be attached to
+    each ChatMsg line for stronger non-repudiation evidence.
     """
 
     def __init__(self, role: str, session_id: Optional[str] = None):
@@ -65,6 +72,22 @@ class Transcript:
 
         # running SHA-256 of all written lines (with trailing "\n")
         self._hasher = hashlib.sha256()
+
+        # Optional peer certificate fingerprint (hex string)
+        self._peer_cert_fingerprint: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Peer certificate fingerprint
+    # ------------------------------------------------------------------
+
+    def set_peer_cert_fingerprint(self, fingerprint_hex: str) -> None:
+        """
+        Record the peer's certificate fingerprint (hex-encoded SHA-256).
+
+        When set, this value will be included on every ChatMsg log line
+        under the JSON field "peer_cert_fp".
+        """
+        self._peer_cert_fingerprint = fingerprint_hex
 
     # ------------------------------------------------------------------
     # Append helpers
@@ -93,8 +116,26 @@ class Transcript:
         self.append_raw_line(json_line)
 
     def append_chat_message(self, msg: ChatMsg) -> None:
-        """Type-safe alias for chat messages."""
-        self.append_message(msg)
+        """
+        Type-safe alias for chat messages.
+
+        If a peer certificate fingerprint has been set, this will log
+        the ChatMsg as JSON with an extra field:
+
+            "peer_cert_fp": "<hex fingerprint>"
+
+        Otherwise, it falls back to regular append_message(msg).
+        """
+        if self._peer_cert_fingerprint is None:
+            # No fingerprint configured; just log the message as-is.
+            self.append_message(msg)
+            return
+
+        # Dump the ChatMsg to a dict with correct aliases, then inject the fp.
+        obj = msg.model_dump(by_alias=True)
+        obj["peer_cert_fp"] = self._peer_cert_fingerprint
+        json_str = json.dumps(obj, separators=(",", ":"))
+        self.append_raw_line(json_str.encode("utf-8"))
 
     # ------------------------------------------------------------------
     # Finalization helpers
