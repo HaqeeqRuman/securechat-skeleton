@@ -1,0 +1,18 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Virtualenv
+.venv/
+
+# Certificates and private keys (do NOT commit secrets)
+certs/
+!certs/.keep
+
+# Transcripts / logs (local evidence only)
+transcripts/
+!transcripts/.keep
+
+# OS junk
+.DS_Store
+Thumbs.db
