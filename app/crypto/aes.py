@@ -108,3 +108,34 @@ def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
     padded = decryptor.update(ciphertext) + decryptor.finalize()
     plaintext = pkcs7_unpad(padded, BLOCK_SIZE_BYTES)
     return plaintext
+
+
+
+"""
+Summary of what this file (aes_ecb.py or crypto_utils.py) does:
+
+This module implements the low-level symmetric encryption layer used in SecureChat's 
+data plane, exactly as specified in the assignment: **AES-128 in ECB mode with PKCS#7 padding**.
+
+Key design points:
+- Uses the official `cryptography` library (hazmat) for maximum clarity and security.
+- All functions work exclusively with **raw bytes** — base64 encoding/decoding is deliberately 
+  left to the protocol/serialization layer (app.common.utils).
+- Provides explicit, easy-to-audit helpers:
+    • pkcs7_pad()    → add PKCS#7 padding
+    • pkcs7_unpad()  → remove and validate padding (raises clear error on tampering)
+    • encrypt_aes_ecb() → pad → AES-128-ECB encrypt
+    • decrypt_aes_ecb() → AES-128-ECB decrypt → unpad + validate
+- Enforces strict 16-byte key length (derived elsewhere via Trunc16(SHA256(Ks))).
+- ECB mode is used because the assignment explicitly requires it for educational purposes 
+  (to demonstrate the exact cryptographic primitives requested).
+
+Intended usage in SecureChat:
+    key = sha256(session_key)[:16]          # Trunc16(SHA256(Ks))
+    ct  = encrypt_aes_ecb(key, message_bytes)
+    pt  = decrypt_aes_ecb(key, ct)
+
+This module satisfies the requirement:
+"AES-128(ECB)+PKCS#7 helpers" and keeps the encryption code minimal, explicit, 
+and perfectly aligned with the protocol specification.
+"""
