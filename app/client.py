@@ -1,5 +1,6 @@
+#!/usr/bin/env python3
 """
-SecureChat Client
+SecureChat Client (Clean Version — No Tamper / No Replay on send)
 
 Features:
   - Plain TCP (no TLS).
@@ -9,25 +10,9 @@ Features:
   - AES-protected registration/login against server-side MySQL.
   - DH #2 => AES-128(ECB)+PKCS#7 K_chat for chat session.
   - RSA PKCS#1 v1.5 + SHA-256 signatures on every ChatMsg.
-  - Replay protection using seqno.
+  - Replay protection (enforced on the server, optional on client receive).
   - Append-only transcript + TranscriptHash.
   - Signed SessionReceipt at teardown.
-
-Message flow:
-  1) Connect to server.
-  2) Client -> Server: HelloMsg (client cert + nonceC).
-  3) Server -> Client: ServerHelloMsg (server cert + nonceS).
-     - Verify server cert using Root CA.
-  4) Client -> Server: DHClientMsg       (DH #1)
-  5) Server -> Client: DHServerMsg       (DH #1)
-     - Derive K_auth = Trunc16(SHA256(big-endian(Ks_auth))).
-  6) Client -> Server: RegisterMsg/LoginMsg (AES-encrypted with K_auth)
-     - Server decrypts and performs registration/login.
-  7) Client -> Server: DHClientMsg       (DH #2)
-  8) Server -> Client: DHServerMsg       (DH #2)
-     - Derive K_chat = Trunc16(SHA256(big-endian(Ks_chat))).
-  9) Encrypted chat (ChatMsg) with K_chat + signatures and replay protection.
- 10) Both sides send/verify SessionReceipt.
 """
 
 from __future__ import annotations
@@ -40,6 +25,7 @@ import json
 import getpass
 
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes  # for server cert fingerprint
 
 from app.common.utils import b64_encode, b64_decode, now_ms
 from app.common.protocol import (
@@ -56,6 +42,7 @@ from app.common.protocol import (
 )
 from app.crypto import dh, aes, sign as rsa_sign, pki
 from app.storage.transcript import Transcript
+
 
 HOST = os.getenv("CHAT_HOST", "127.0.0.1")
 PORT = int(os.getenv("CHAT_PORT", "9000"))
@@ -76,7 +63,7 @@ def _recv_lines(sock: socket.socket):
         while b"\n" in buffer:
             line, buffer = buffer.split(b"\n", 1)
             if line.strip():
-                yield line.decode("utf-8")
+                yield line.decode("utf-8", errors="replace")
 
 
 def main():
@@ -103,8 +90,7 @@ def main():
 
         # ---------- 0) PKI hello / server_hello ----------
 
-        import os as _os
-        nonce_c = _os.urandom(16)
+        nonce_c = os.urandom(16)
         nonce_c_b64 = b64_encode(nonce_c)
 
         hello = HelloMsg(
@@ -128,20 +114,26 @@ def main():
             transcript.close()
             return
 
-        transcript.append_message(server_hello)
-
-        # Decode and verify server certificate
+        # Decode and verify server certificate BEFORE appending server_hello
         try:
             server_cert_pem = b64_decode(server_hello.server_cert)
             server_cert = x509.load_pem_x509_certificate(server_cert_pem)
             pki.verify_certificate(server_cert, ca_cert, expected_hostname="server.local")
             peer_pub_key = server_cert.public_key()
             print("[PKI] Server certificate verified (CN=server.local)")
+
+            # Use SERVER cert fingerprint as canonical peer_cert_fp on both sides
+            fp = server_cert.fingerprint(hashes.SHA256()).hex()
+            transcript.set_peer_cert_fingerprint(fp)
+
         except Exception as e:
             print(f"[BAD_CERT] Server certificate verification failed: {e}")
             s.close()
             transcript.close()
             return
+
+        # Now append ServerHello AFTER setting fingerprint (order matches server logic)
+        transcript.append_message(server_hello)
 
         # ---------- 1) DH #1 handshake (client role, K_auth) ----------
 
@@ -267,20 +259,17 @@ def main():
                     # Handle SessionReceipt from server
                     if isinstance(msg, ReceiptMsg):
                         my_hash = transcript.transcript_hash_hex()
-                        if my_hash != msg.transcript_sha256:
-                            print("[RECEIPT_FAIL] transcript hash mismatch")
+                        hash_ok = (my_hash == msg.transcript_sha256)
+                        sig_ok = rsa_sign.verify_signature(
+                            peer_pub_key,
+                            msg.transcript_sha256.encode("ascii"),
+                            b64_decode(msg.sig),
+                        )
+                        if hash_ok and sig_ok:
+                            print("[RECEIPT_OK] Server SessionReceipt verified")
                         else:
-                            sig_bytes = b64_decode(msg.sig)
-                            ok = rsa_sign.verify_signature(
-                                peer_pub_key,
-                                msg.transcript_sha256.encode("ascii"),
-                                sig_bytes,
-                            )
-                            if ok:
-                                print("[RECEIPT_OK] Server SessionReceipt verified")
-                            else:
-                                print("[RECEIPT_FAIL] invalid RSA signature on receipt")
-                        transcript.append_message(msg)
+                            print("[RECEIPT_FAIL] transcript hash or signature mismatch")
+                        # DO NOT append ReceiptMsg to transcript
                         continue
 
                     # Handle ChatMsg from server
@@ -288,12 +277,9 @@ def main():
                         print(f"[WARN] Ignoring non-chat message: {msg}")
                         continue
 
-                    # Replay protection
+                    # Replay protection (client-side view)
                     if peer_last_seq is not None and msg.seqno <= peer_last_seq:
-                        print(
-                            f"[REPLAY] Dropping message seqno={msg.seqno}, "
-                            f"last seen={peer_last_seq}"
-                        )
+                        print(f"[REPLAY] seq={msg.seqno} (last {peer_last_seq})")
                         continue
 
                     ct_b64 = msg.ct
@@ -344,9 +330,11 @@ def main():
                     print("[*] Client exiting chat")
                     break
 
+                # Encrypt plaintext with K_chat
                 ct = aes.encrypt_aes_ecb(K_chat, text.encode("utf-8"))
                 ct_b64 = b64_encode(ct)
 
+                # Build signed message
                 ts = now_ms()
                 to_sign = f"{seqno}|{ts}|{ct_b64}".encode("utf-8")
                 sig_bytes = rsa_sign.sign_bytes(priv_key, to_sign)
@@ -384,6 +372,12 @@ def main():
 
             sig_bytes = rsa_sign.sign_bytes(priv_key, t_hash.encode("ascii"))
             receipt.sig = b64_encode(sig_bytes)
+
+            # Log the receipt itself in the transcript (AFTER computing t_hash)
+            try:
+                transcript.append_message(receipt)
+            except Exception as e:
+                print(f"[WARN] Failed to append receipt to transcript: {e}")
 
             try:
                 s.sendall(encode_message(receipt).encode("utf-8") + b"\n")
