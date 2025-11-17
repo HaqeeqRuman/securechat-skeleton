@@ -1,111 +1,274 @@
+SecureChat – Assignment #2
+CS-3002 Information Security – Fall 2025
 
-# SecureChat – Assignment #2 (CS-3002 Information Security, Fall 2025)
+SecureChat is a console-based secure messaging system built without TLS, implementing Confidentiality, Integrity, Authenticity, and Non-Repudiation (CIANR) using application-layer cryptography.
 
-This repository is the **official code skeleton** for your Assignment #2.  
-You will build a **console-based, PKI-enabled Secure Chat System** in **Python**, demonstrating how cryptographic primitives combine to achieve:
+All crypto operations are performed manually using AES, RSA, Diffie–Hellman, SHA-256, and X.509 certificates signed by a custom Root CA.
 
-**Confidentiality, Integrity, Authenticity, and Non-Repudiation (CIANR)**.
+This README explains the environment setup, protocol workflow, cryptographic design, usage instructions, and the results of all required security tests.
 
+1. Features
 
-## 🧩 Overview
+SecureChat implements:
 
-You are provided only with the **project skeleton and file hierarchy**.  
-Each file contains docstrings and `TODO` markers describing what to implement.
+PKI and Certificates
+Client and server exchange X.509 certificates and verify them using the local Root CA.
 
-Your task is to:
-- Implement the **application-layer protocol**.
-- Integrate cryptographic primitives correctly to satisfy the assignment spec.
-- Produce evidence of security properties via Wireshark, replay/tamper tests, and signed session receipts.
+Two Diffie–Hellman Exchanges
+DH #1 produces K_auth for encrypted login.
+DH #2 produces K_chat for encrypted chat messages.
 
-## 🏗️ Folder Structure
-```
+AES Encryption (ECB + PKCS#7)
+Used for confidentiality of credentials and messages.
+
+RSA Signatures (SHA-256)
+Every chat message is digitally signed for integrity and authentication.
+
+Replay Protection
+Each endpoint enforces strictly increasing sequence numbers.
+
+Append-Only Transcript with TranscriptHash
+All messages logged for auditing and non-repudiation.
+
+Signed SessionReceipt
+Verifiable proof of session integrity.
+
+2. Project Structure
 securechat-skeleton/
 ├─ app/
-│  ├─ client.py              # Client workflow (plain TCP, no TLS)
-│  ├─ server.py              # Server workflow (plain TCP, no TLS)
+│  ├─ client.py
+│  ├─ server.py
 │  ├─ crypto/
-│  │  ├─ aes.py              # AES-128(ECB)+PKCS#7 (use cryptography lib)
-│  │  ├─ dh.py               # Classic DH helpers + key derivation
-│  │  ├─ pki.py              # X.509 validation (CA signature, validity, CN)
-│  │  └─ sign.py             # RSA SHA-256 sign/verify (PKCS#1 v1.5)
+│  │  ├─ aes.py
+│  │  ├─ dh.py
+│  │  ├─ pki.py
+│  │  └─ sign.py
 │  ├─ common/
-│  │  ├─ protocol.py         # Pydantic message models (hello/login/msg/receipt)
-│  │  └─ utils.py            # Helpers (base64, now_ms, sha256_hex)
+│  │  ├─ protocol.py
+│  │  └─ utils.py
 │  └─ storage/
-│     ├─ db.py               # MySQL user store (salted SHA-256 passwords)
-│     └─ transcript.py       # Append-only transcript + transcript hash
+│     ├─ db.py
+│     └─ transcript.py
 ├─ scripts/
-│  ├─ gen_ca.py              # Create Root CA (RSA + self-signed X.509)
-│  └─ gen_cert.py            # Issue client/server certs signed by Root CA
-├─ tests/manual/NOTES.md     # Manual testing + Wireshark evidence checklist
-├─ certs/.keep               # Local certs/keys (gitignored)
-├─ transcripts/.keep         # Session logs (gitignored)
-├─ .env.example              # Sample configuration (no secrets)
-├─ .gitignore                # Ignore secrets, binaries, logs, and certs
-├─ requirements.txt          # Minimal dependencies
-└─ .github/workflows/ci.yml  # Compile-only sanity check (no execution)
-```
+│  ├─ gen_ca.py
+│  └─ gen_cert.py
+├─ transcripts/
+├─ certs/
+├─ tests/manual/
+├─ requirements.txt
+└─ README.md
 
-## ⚙️ Setup Instructions
+3. Setup Instructions
+Create environment
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 
-1. **Fork this repository** to your own GitHub account(using official nu email).  
-   All development and commits must be performed in your fork.
+MySQL setup (Docker recommended)
+docker run -d --name securechat-db \
+    -e MYSQL_ROOT_PASSWORD=rootpass \
+    -e MYSQL_DATABASE=securechat \
+    -e MYSQL_USER=scuser \
+    -e MYSQL_PASSWORD=scpass \
+    -p 3306:3306 mysql:8
 
-2. **Set up environment**:
-   ```bash
-   python3 -m venv .venv && source .venv/bin/activate
-   pip install -r requirements.txt
-   cp .env.example .env
-   ```
 
-3. **Initialize MySQL** (recommended via Docker):
-   ```bash
-   docker run -d --name securechat-db        -e MYSQL_ROOT_PASSWORD=rootpass        -e MYSQL_DATABASE=securechat        -e MYSQL_USER=scuser        -e MYSQL_PASSWORD=scpass        -p 3306:3306 mysql:8
-   ```
+Create database tables:
 
-4. **Create tables**:
-   ```bash
-   python -m app.storage.db --init
-   ```
+python -m app.storage.db --init
 
-5. **Generate certificates** (after implementing the scripts):
-   ```bash
-   python scripts/gen_ca.py --name "FAST-NU Root CA"
-   python scripts/gen_cert.py --cn server.local --out certs/server
-   python scripts/gen_cert.py --cn client.local --out certs/client
-   ```
+Generate certificates
+python scripts/gen_ca.py --name "FAST-NU Root CA"
+python scripts/gen_cert.py --cn server.local --out certs/server
+python scripts/gen_cert.py --cn client.local --out certs/client
 
-6. **Run components** (after implementation):
-   ```bash
-   python -m app.server
-   # in another terminal:
-   python -m app.client
-   ```
+4. How the System Works (Full Workflow)
 
-## 🚫 Important Rules
+This section explains the cryptographic logic implemented in the assignment.
 
-- **Do not use TLS/SSL or any secure-channel abstraction**  
-  (e.g., `ssl`, HTTPS, WSS, OpenSSL socket wrappers).  
-  All crypto operations must occur **explicitly** at the application layer.
+4.1 PKI Hello
 
-- You are **not required** to implement AES, RSA, or DH math, Use any of the available libraries.
-- Do **not commit secrets** (certs, private keys, salts, `.env` values).
-- Your commits must reflect progressive development — at least **10 meaningful commits**.
+Client sends its certificate + nonce.
+Server responds with its certificate + nonce.
 
-## 🧾 Deliverables
+Client verifies:
 
-When submitting on Google Classroom (GCR):
+• CA signature
+• Certificate validity dates
+• Common Name matches server.local
 
-1. A ZIP of your **GitHub fork** (repository).
-2. MySQL schema dump and a few sample records.
-3. Updated **README.md** explaining setup, usage, and test outputs.
-4. `RollNumber-FullName-Report-A02.docx`
-5. `RollNumber-FullName-TestReport-A02.docx`
+Server does the same for the client.
 
-## 🧪 Test Evidence Checklist
+4.2 Diffie–Hellman Exchange #1
 
-✔ Wireshark capture (encrypted payloads only)  
-✔ Invalid/self-signed cert rejected (`BAD_CERT`)  
-✔ Tamper test → signature verification fails (`SIG_FAIL`)  
-✔ Replay test → rejected by seqno (`REPLAY`)  
-✔ Non-repudiation → exported transcript + signed SessionReceipt verified offline  
+Generates a shared AES key called K_auth.
+
+Used only for encrypted login or registration.
+
+Process:
+
+• A1 = g^a mod p
+• B1 = g^b mod p
+• shared_secret = B1^a mod p
+• K_auth = SHA256(shared_secret)[0:16]
+
+4.3 Encrypted Login / Register
+
+Credentials are encrypted with AES-128-ECB using K_auth.
+
+Server decrypts, verifies user in MySQL, and authenticates.
+
+4.4 Diffie–Hellman Exchange #2
+
+Produces K_chat used for all encrypted chat messages.
+
+4.5 Secure Chat Messages
+
+Each chat message contains:
+
+• seqno
+• timestamp
+• ciphertext (AES-ECB)
+• RSA signature over:
+"{seq}|{timestamp}|{ct}"
+
+Receiver verifies:
+
+• Sequence strictly increasing
+• RSA signature valid
+• AES decrypts successfully
+
+If signature fails → SIG_FAIL
+If replayed seqno → REPLAY
+
+4.6 Append-Only Transcript
+
+Every event is written to:
+
+transcripts/session-XXXXXXXX-client.log
+transcripts/session-XXXXXXXX-server.log
+
+
+Each transcript ends with a SHA-256 hash of all prior lines.
+
+4.7 SessionReceipt for Non-Repudiation
+
+At the end of the session:
+
+• Compute transcript_hash
+• Sign it using RSA private key
+• Send SessionReceipt message
+
+Anyone offline can verify:
+
+• Transcript integrity
+• Signature authenticity
+• Sequence coverage (first_seq to last_seq)
+
+5. Running the System
+
+Start server:
+
+python -m app.server
+
+
+Start client:
+
+python -m app.client
+
+
+Client prompts:
+
+Auth mode [register/login]:
+Email:
+Password:
+
+
+Then chat begins:
+
+client> hello
+[SERVER #1] hi
+
+
+Exit with:
+
+client> exit
+
+6. Test Results (Required by Assignment)
+
+Below are the exact behaviors generated by the implementation.
+
+6.1 Wireshark Evidence
+
+All chat contents appear only as encrypted AES ciphertext.
+No plaintext credentials or messages appear in packet capture.
+
+6.2 Invalid / Self-Signed Certificate Test
+
+If the server presents a wrong certificate:
+
+[BAD_CERT] Server certificate invalid
+
+
+Connection terminates immediately.
+
+6.3 Tamper Test – Signature Failure
+
+Manually flipping one bit in ciphertext or signature:
+
+[SIG_FAIL] Dropping message
+
+
+Message is discarded without decryption.
+
+Integrity and authenticity verified correctly.
+
+6.4 Replay Test – Duplicate Sequence Number
+
+If an old message is re-sent:
+
+[REPLAY] seq=2 (last 2)
+
+
+Replay successfully detected and rejected.
+
+6.5 Non-Repudiation Test
+
+Run:
+
+python verify_nonrepudiation.py
+
+
+Expected output:
+
+[MSG] seq=1 from=client sig_ok=True
+[MSG] seq=1 from=server sig_ok=True
+[MSG] seq=2 from=client sig_ok=True
+...
+
+[HASH] Recomposed TranscriptHash = <value>
+
+[CHECK] Receipt signature valid: True
+[CHECK] TranscriptHash match: True
+
+
+If you modify even a single character in the transcript:
+
+TranscriptHash mismatch
+
+
+Non-repudiation verified.
+
+7. Known Correct Behavior
+
+• Valid messages decrypt and verify normally
+• Tampered messages fail signature check
+• Replay attempts rejected by seqno
+• Invalid certificates rejected
+• Transcript hash consistent across client and server
+• SessionReceipt signature passes offline verification
+
+8. Conclusion
+
+This project demonstrates a complete secure communications protocol built entirely at the application level. The SecureChat system successfully integrates PKI, DH, AES, RSA, replay protection, transcript auditing, and non-repudiation.
